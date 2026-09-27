@@ -14,10 +14,9 @@ import torch
 from torch import nn
 from model.jllama import JLlama
 from model.util import load_hf_weights
+from model.constants import MODEL_ID
 
 def basic():
-    MODEL_ID = "meta-llama/Llama-3.1-8B"
-
     config = AutoConfig.from_pretrained(MODEL_ID)
     tokenzier = AutoTokenizer.from_pretrained(MODEL_ID)
 
