@@ -13,7 +13,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 import torch
 from torch import nn
 from model.jllama import JLlama
-from model.util import load_hf_weights
+from model.util import load_hf_weights, resolve_torch_dtype
 from model.constants import MODEL_ID
 
 def basic():
@@ -22,7 +22,7 @@ def basic():
 
     hf_model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
-            dtype=config.dtype,
+            dtype=resolve_torch_dtype(config.dtype),
     ).to(device="mps")
 
     personal_model = JLlama(config)

@@ -111,11 +111,9 @@ class Request:
         self.sampling_params = sampling_params
         self.text = []
         self.status = RequestStatus.WAITING
-        # to prepare for pagedattention, this will be a list of block ids which are pointers to
-        # actual tensors in the kv cache manager. Since first step is just one big contiguous 
-        # tensor, list will be of size 1
+        # invariant: block at the end of the list might not be full, all
+        # other blocks should be
         self.cache_blocks = []
-        self.kv_cache = None
         self.cache_len = 0
 
     def __repr__(self) -> str:
@@ -139,5 +137,12 @@ class Request:
     def append_cache_block(self, block_id: int) -> None:
         self.cache_blocks.append(block_id)
 
-    def set_kv(self, kv_cache: torch.Tensor) -> None:
-        self.kv_cache = kv_cache
+    def get_tokens_for_batch(self) -> torch.Tensor:
+        # helper function to return what tokens need to be in the
+        # input to the forward pass, dependent on request status
+        if self.status == RequestStatus.PREFILLING:
+            return self.token_ids
+        elif self.status == RequestStatus.DECODING:
+            return self.token_ids[:, -1:]
+        else:
+            raise Exception(f"Request {self} in unexpected state for get_tokens_for_batch.")

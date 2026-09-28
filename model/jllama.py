@@ -3,6 +3,8 @@ import sys
 from torch import nn
 import torch.nn.functional as F
 from math import sqrt
+from engine.kv_manager import PhysicalBlock
+from model.constants import BLOCK_SIZE, PAD_TOKEN_ID
 
 class MLP(nn.Module):
     '''
@@ -45,6 +47,16 @@ def rope(
     #   file=sys.stderr,
     # )
 
+
+    if x.ndim == 3:
+        x = x.unsqueeze(0)
+        remove_batch_dimension = True
+    elif x.ndim == 4:
+        remove_batch_dimension = False
+    else:
+        raise ValueError(
+            f"x must have shape [H, S, D] or [B, H, S, D], got {tuple(x.shape)}"
+        )
 
     batch_size, _, seq_len, head_dim = x.shape
 
@@ -153,7 +165,12 @@ def rope(
         dim=-1,
     )
 
-    return x * cos + rotated * sin
+    result = x * cos + rotated * sin
+
+    if remove_batch_dimension:
+        result = result.squeeze(0)
+
+    return result
 
 
 class GroupQueryAttention(nn.Module):
@@ -166,109 +183,204 @@ class GroupQueryAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.layer_idx = layer_idx
 
-    def forward(self, x: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor):
-        # first, get projections
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_blocks: list[list[PhysicalBlock]],
+        cache_lens: list[int],
+        req_to_bounds: dict,
+    ):
+        # for continuous batching/pagedattention, split x by request and reform into
+        # stagewise batches.
+
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
         # second, split into multi-head setup
-        q = q.view(q.shape[0], q.shape[1], self.config.num_attention_heads, self.config.head_dim).transpose(1,2)
-        k = k.view(k.shape[0], k.shape[1], self.config.num_key_value_heads, self.config.head_dim).transpose(1,2)
-        v = v.view(v.shape[0], v.shape[1], self.config.num_key_value_heads, self.config.head_dim).transpose(1,2)
+        q = q.view(q.shape[0], self.config.num_attention_heads, self.config.head_dim).transpose(0,1)
+        k = k.view(k.shape[0], self.config.num_key_value_heads, self.config.head_dim).transpose(0,1)
+        v = v.view(v.shape[0], self.config.num_key_value_heads, self.config.head_dim).transpose(0,1)
 
-        num_tokens = x.shape[1]
-        # this works because of left padding, all sequences in batch have the some
-        # cache length and logit is rightmost (also assumes all requests are in same phase)
-        start_idx = cache_len[0]
-        end_idx = start_idx + num_tokens
+        position_ids = []
+        # for (start, end), req_blocks in zip(req_to_bounds.values(), cache_blocks):
+        for i in range(len(cache_blocks)):
+            req_blocks = cache_blocks[i]
+            seq_len = req_to_bounds[i][1] - req_to_bounds[i][0]
+            cache_len = cache_lens[i]
+            position_ids.append(
+                torch.arange(
+                    cache_len,
+                    cache_len + seq_len,
+                    device=x.device,
+                )
+            )
+        position_ids = torch.cat(position_ids)
 
-        # Cache slots use a shared padded timeline, while RoPE uses each
-        # sequence's logical position timeline.
-        pad_lengths = torch.tensor(
-            [(max(prompt_lens) - prompt_len) for prompt_len in prompt_lens],
-            device=x.device,
-            dtype=torch.long,
-        )
-        physical_positions = torch.arange(
-            start_idx,
-            end_idx,
-            device=x.device,
-        )
-        position_ids = (
-            physical_positions[None, :] - pad_lengths[:, None]
-        ).clamp_min(0)
-        # print(f"pad lengths: {pad_lengths.shape}")
-        # print(f"physical_positions: {physical_positions.shape}")
-        # print(f"position_ids: {position_ids.shape}")
+        q = rope(q, self.config.rope_parameters, position_ids)
+        k = rope(k, self.config.rope_parameters, position_ids)
 
-        q_rope = rope(q, self.config.rope_parameters, position_ids)
-        k_rope = rope(k, self.config.rope_parameters, position_ids)
+        # for prefill, we don't need to use the cache since it contains the same data as raw
+        # qkv. The request bounds were computed before the forward pass because they are
+        # also needed by the executor to decode the returned 2D logits tensor.
+        prefill = {}
+        # for decode we will actually use the cache so map its contents
+        decode = {}
+        decode_ranges = []
+        max_prefill_len = 0
+        for i, (ctr, end) in enumerate(req_to_bounds.values()):
+            seq_len = end - ctr
+            req_blocks = cache_blocks[i]
+            if seq_len == 1:
+                # idx_to_replace = BLOCK_SIZE - req_blocks[-1].space_remaining
+                idx_to_replace = cache_lens[i] % BLOCK_SIZE
+                req_blocks[-1].tensor[self.layer_idx, 0, :, idx_to_replace:idx_to_replace+1, :] = k[:, ctr:end, :]
+                req_blocks[-1].tensor[self.layer_idx, 1, :, idx_to_replace:idx_to_replace+1, :] = v[:, ctr:end, :]
+                req_q = q[:, ctr:end, :]
+                req_k = []
+                req_v = []
+                for j in range(len(req_blocks)):
+                    block = req_blocks[j]
+                    # account for the fact that we just generated a new token
+                    if j + 1 == len(req_blocks):
+                        tokens_in_block = (cache_lens[i] % BLOCK_SIZE) + 1
+                    else:
+                        tokens_in_block = BLOCK_SIZE
+                    req_k.append(block.tensor[self.layer_idx, 0, :, :tokens_in_block, :])
+                    req_v.append(block.tensor[self.layer_idx, 1, :, :tokens_in_block, :])
+                # only include valid tokens in each block, will add left padding later to balance as necessary
+                # req_k = [block.tensor[self.layer_idx, 0, :, BLOCK_SIZE - block.space_remaining, :] for block in req_blocks]
+                # req_v = [block.tensor[self.layer_idx, 1, :, BLOCK_SIZE - block.space_remaining, :] for block in req_blocks]
+                decode[i] = (req_q, req_k, req_v)
+                decode_ranges.append((i, ctr, end))
+            else:
+                for j in range(len(req_blocks)):
+                    start = j * BLOCK_SIZE
+                    p_end = min(start + BLOCK_SIZE, seq_len)
+                    tokens_in_block = p_end - start
+                    req_blocks[j].tensor[self.layer_idx, 0, :, :tokens_in_block, :] = k[:, ctr + start:ctr + p_end, :]
+                    req_blocks[j].tensor[self.layer_idx, 1, :, :tokens_in_block, :] = v[:, ctr + start:ctr + p_end, :]
+                prefill[i] = (ctr, end)
+                max_prefill_len = max(max_prefill_len, end-ctr)
 
-        # update cache, this is pretty janky since no paged attention (block id is which 
-        # index to use along batch dim), kv cache tensors have dim 
-        # [layer_num, 2, batch size, num k/v heads, sequence len, hidden_size]
+        # setup Q/K/V matricies for prefill
+        p_q = []
+        p_k = []
+        p_v = []
+        for start, end in prefill.values():
+            padding = max_prefill_len - (end - start)
+            req_q = F.pad(q[:, start:end, :], (0,0,padding,0))
+            req_k = F.pad(k[:, start:end, :], (0,0,padding,0))
+            req_v = F.pad(v[:, start:end, :], (0,0,padding,0))
+            p_q.append(req_q)
+            p_k.append(req_k)
+            p_v.append(req_v)
 
-        # select just the requests (along batch size dimension) that are active right now, using
-        # the fact that cache blocks is just a one element list
-        batchwise_indicies = torch.Tensor([req_blocks[0] for req_blocks in cache_blocks]).to(device=kv_cache.device, dtype=torch.long)
+        # stack q,k,v along batch size dimension
+        if prefill:
+            p_q = torch.stack(tuple(p_q))
+            p_k = torch.stack(tuple(p_k))
+            p_v = torch.stack(tuple(p_v))
 
-        # choosing to store even the padded keys for simplicity, following code manages this
-        kv_cache[self.layer_idx, 0, :, :, start_idx:end_idx, :].index_copy_(0, batchwise_indicies, k_rope)
-        # kv_cache[self.layer_idx, 0, :, :, start_idx:end_idx, :] = k_rope
-        kv_cache[self.layer_idx, 1, :, :, start_idx:end_idx, :].index_copy_(0, batchwise_indicies, v)
-        # kv_cache[self.layer_idx, 1, :, :, start_idx:end_idx, :] = v
+        # set up Q/K/V matricies for decode
+        d_q = []
+        d_k = []
+        d_v = []
+        max_len = 0
+        for decode_req in decode:
+            vals = decode[decode_req]
+            d_q.append(vals[0])
+            k_concat = torch.cat(tuple(vals[1]), dim=-2)
+            v_concat = torch.cat(tuple(vals[2]), dim=-2)
+            d_k.append(k_concat)
+            d_v.append(v_concat)
+            max_len = max(max_len, k_concat.shape[-2])
 
-        # cached_k = kv_cache[self.layer_idx, 0, :, :, :end_idx, :]
-        # cached_v = kv_cache[self.layer_idx, 1, :, :, :end_idx, :]
-        cached_k = kv_cache[self.layer_idx, 0, :, :, :end_idx, :].index_select(0, batchwise_indicies)
-        cached_v = kv_cache[self.layer_idx, 1, :, :, :end_idx, :].index_select(0, batchwise_indicies)
+        decode_lengths = [k_tensor.shape[-2] for k_tensor in d_k]
+
+        if decode:
+            # stack q,k,v along batch size dimension
+            d_q = torch.stack(tuple(d_q))
+            # add padding where necessary for k/v blocks
+            for i in range(len(d_k)):
+                padding = max_len - d_k[i].shape[-2]
+                # F.pad arguments apply from last dimension, so (D_left, D_right, S_left, S_right)
+                d_k[i] = F.pad(d_k[i], (0,0,padding,0))
+                d_v[i] = F.pad(d_v[i], (0,0,padding,0))
+            d_k = torch.stack(tuple(d_k))
+            d_v = torch.stack(tuple(d_v))
 
         # scale k and v to match correct dimensions
         scale_factor = self.config.num_attention_heads // self.config.num_key_value_heads
-        # k_rope = torch.repeat_interleave(k_rope, scale_factor, dim=1)
-        # v = torch.repeat_interleave(v, scale_factor, dim=1)
-        k = torch.repeat_interleave(cached_k, scale_factor, dim=-3)
-        v = torch.repeat_interleave(cached_v, scale_factor, dim=-3)
+        if decode:
+            d_k = torch.repeat_interleave(d_k, scale_factor, dim=-3)
+            d_v = torch.repeat_interleave(d_v, scale_factor, dim=-3)
+            d_s = (d_q @ d_k.transpose(-1, -2)) / sqrt(self.config.head_dim)
+        if prefill:
+            p_k = torch.repeat_interleave(p_k, scale_factor, dim=-3)
+            p_v = torch.repeat_interleave(p_v, scale_factor, dim=-3)
+            p_s = (p_q @ p_k.transpose(-1, -2)) / sqrt(self.config.head_dim)
 
-        # compute attention across each head
-        # s = (q_rope @ k_rope.transpose(-1, -2)) / sqrt(self.config.head_dim)
-        s = (q_rope @ k.transpose(-1, -2)) / sqrt(self.config.head_dim)
-
-        all_positions = torch.arange(end_idx, device=s.device, dtype=torch.int32)
-        valid_keys = all_positions[None, :] >= pad_lengths[:, None]
-        valid_queries = valid_keys
-
-        # we need more complicated masking for prefill
-        if s.shape[-2] != 1:
-            casual = all_positions[None, :] <= all_positions[:, None]
-            # generate combined mask that is valid both casually and w.r.t. each seq len
-            casual_and_positional = casual[None, :, :] & valid_keys[:, None, :]
+        # convert scores into probabilities via masking, then matmul with values
+        output = torch.empty_like(x)
+        if prefill:
+            pad_lens = max_prefill_len - torch.tensor(
+                [end - start for start, end in prefill.values()],
+                device=p_s.device,
+                dtype=torch.long,
+            )
+            positions = torch.arange(max_prefill_len, device=p_s.device)
+            valid_queries = positions[None, :] >= pad_lens[:, None]
+            valid_keys = valid_queries
+            causal = positions[None, :] <= positions[:, None]
+            valid_attention = valid_keys[:, None, :] & causal[None, :, :]
 
             # at this point, the mask is correct. However, due to padded queries, some rows
             # in the score matrix will be entirely masked out, which would cause NaNs in the
             # softmax. To avoid this, allow padded queries to attend to valid keys, and 
             # remove the impact of padded queries after softmax has been caclculated
-            # broadcasting: queries are rows in the score matmul and keys are columns, so bradcast
+            # broadcasting: queries are rows in the score matmul and keys are columns, so broadcast
             # valid queries across all columns and broadcast keys across all rows
-            valid_pos = casual_and_positional | (~valid_queries[:, :, None] & valid_keys[:, None, :])
-            
-            # unsqueeze to broadcast across head dimension
-            s.masked_fill_(~valid_pos[:, None, :, :], float('-inf'))
+            safe_attention = torch.where(
+                valid_queries[:, :, None],
+                valid_attention,
+                valid_keys[:, None, :],
+            )
+            p_s = p_s.masked_fill(
+                ~safe_attention[:, None, :, :],
+                float("-inf"),
+            )
+            p_probs = torch.softmax(p_s, dim=-1).to(p_v.dtype)
+            p_out = p_probs @ p_v
+            p_out = p_out.masked_fill(
+                ~valid_queries[:, None, :, None],
+                0.0,
+            )
 
-            p = torch.softmax(s, dim=-1).to(v.dtype)
-            # reverse the softmax patching we did before 
-            p = p.masked_fill(~valid_queries[:, None, :, None], 0.0)
+            for batch_index, (start, end) in enumerate(prefill.values()):
+                request_len = end - start
+                # get last request_len tokens to avoid left padded ones
+                output[start:end] = (
+                    p_out[batch_index, :, -request_len:, :]
+                    .transpose(0, 1)
+                    .flatten(-2, -1)
+                )
 
-        else:
-            # mask out invalid keys
-            s.masked_fill_(~valid_keys[:, None, None, :], float('-inf'))
-            p = torch.softmax(s, dim=-1).to(v.dtype)
+        if decode:
+            pad_lens = max_len - torch.tensor(decode_lengths, device=d_s.device, dtype=torch.long)
+            positions = torch.arange(max_len, device=d_s.device)
+            valid_keys = positions[None, :] >= pad_lens[:, None]
+            d_s = d_s.masked_fill(~valid_keys[:, None, None, :], float("-inf"))
+            d_probs = torch.softmax(d_s, dim=-1).to(d_v.dtype)
+            d_out = d_probs @ d_v
 
-        # rearrange output to [B, # heads, seq_len, head_dim] to [B, seq_len, hidden_dim]
-        out = (p @ v).transpose(1, 2).flatten(-2, -1)
-        return self.o_proj(out)
+            for batch_index, (_, start, end) in enumerate(decode_ranges):
+                output[start:end] = (
+                    d_out[batch_index, :, 0, :]
+                    .reshape(1, -1)
+                )
 
+        return self.o_proj(output)
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
@@ -280,8 +392,14 @@ class Block(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
-    def forward(self, x: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
-        attn_out = self.attention(self.attn_norm(x), prompt_lens, cache_blocks, cache_len, kv_cache)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_blocks: list[list[PhysicalBlock]],
+        cache_lens: list[int],
+        req_to_bounds: dict,
+    ) -> torch.Tensor:
+        attn_out = self.attention(self.attn_norm(x), cache_blocks, cache_lens, req_to_bounds)
         x = x + attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
         return x + mlp_out
@@ -303,14 +421,20 @@ class JLlama(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.max_seq_len = config.max_position_embeddings
 
-    def forward(self, input_ids: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache_blocks: list[list[PhysicalBlock]],
+        cache_lens: list[int],
+        req_to_bounds: dict,
+    ) -> torch.Tensor:
         # check that sequence length is valid
         if input_ids.shape[-1] >= self.max_seq_len:
             raise Exception("max sequence length exceeded")
 
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x, prompt_lens, cache_blocks, cache_len, kv_cache)
+            x = layer(x, cache_blocks, cache_lens, req_to_bounds)
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits
