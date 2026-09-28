@@ -52,12 +52,14 @@ class Server():
             if tokens_processed == 1:
                 last_generated = perf_counter()
                 ttft = last_generated - ttft
-                print(f"token #{tokens_processed}: '{token}' generated in {ttft} sec")
+                if self.benchmark >= 1:
+                    print(f"token #{tokens_processed}: '{token}' generated in {ttft} sec")
             else: 
 
                 tbt = generated_at - last_generated
                 tbt_sum += tbt
-                print(f"token #{tokens_processed}: '{token}' generated in {tbt} sec")
+                if self.benchmark >= 1:
+                    print(f"token #{tokens_processed}: '{token}' generated in {tbt} sec")
             last_generated = generated_at
 
         benchmarks = {'TTFT':ttft, 'TBT':tbt_sum / tokens_processed}

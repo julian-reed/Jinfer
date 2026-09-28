@@ -10,12 +10,17 @@ prompts = [
     "Hables espanol? If so, prove it with the most creative paragraph you can think of."
 ]
 
+# how much benchmarking output to see, higher = more and 0 = none
+BENCHMARK = 1
+
 async def main():
     device = "mps"
 
-    benchmark_memory("before starting server", device)
-    server = Server(debug=1, benchmark=1, device="mps")
-    benchmark_memory("after starting server", device)
+    if BENCHMARK >= 1:
+        benchmark_memory("before starting server", device)
+    server = Server(debug=1, benchmark=BENCHMARK, device="mps")
+    if BENCHMARK >= 1:
+        benchmark_memory("after starting server", device)
 
     for i in range(len(prompts)):
         prompt = prompts[i]
@@ -23,9 +28,9 @@ async def main():
 
         # archived sampling params: min_p=0.1
         out_dict = await server.generate(prompt, top_k=1)
-        benchmark_memory(f"after prompt {i}", device)
-
-        print(f"benchmark stats: TTFT: {out_dict['benchmarks']['TTFT']}, TBT: {out_dict['benchmarks']['TBT']}")
+        if BENCHMARK >= 1:
+            benchmark_memory(f"after prompt {i}", device)
+            print(f"benchmark stats: TTFT: {out_dict['benchmarks']['TTFT']}, TBT: {out_dict['benchmarks']['TBT']}")
         print("text:")
         print(out_dict['text'])
 

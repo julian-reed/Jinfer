@@ -55,6 +55,8 @@ class SamplingParams:
     # making this a function in case want to change up sampling algo,
     # using simple multinomial for now
     def sample(self, probs: torch.Tensor) -> torch.Tensor:
+        if self.top_k == 1:
+            return torch.argmax(probs, dim=-1, keepdim=True)
         return torch.multinomial(probs, num_samples=1)
 
 class RequestStatus(Enum):
@@ -109,6 +111,12 @@ class Request:
         self.sampling_params = sampling_params
         self.text = []
         self.status = RequestStatus.WAITING
+        # to prepare for pagedattention, this will be a list of block ids which are pointers to
+        # actual tensors in the kv cache manager. Since first step is just one big contiguous 
+        # tensor, list will be of size 1
+        self.cache_blocks = []
+        self.kv_cache = None
+        self.cache_len = 0
 
     def append_token_id(self, new_token: int) -> None:
         # todo: change this so it doesn't alloc new memory each time
@@ -124,3 +132,9 @@ class Request:
 
     def get_text(self) -> str:
         return "".join(self.text)
+
+    def append_cache_block(self, block_id: int) -> None:
+        self.cache_blocks.append(block_id)
+
+    def set_kv(self, kv_cache: torch.Tensor) -> None:
+        self.kv_cache = kv_cache
