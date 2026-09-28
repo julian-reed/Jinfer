@@ -18,21 +18,23 @@ async def main():
 
     if BENCHMARK >= 1:
         benchmark_memory("before starting server", device)
-    server = Server(debug=1, benchmark=BENCHMARK, device="mps")
+    server = Server(skip_load=False, debug=1, benchmark=BENCHMARK, device="mps")
     if BENCHMARK >= 1:
         benchmark_memory("after starting server", device)
 
-    for i in range(len(prompts)):
-        prompt = prompts[i]
-        print(f"serving prompt {prompt}")
+    tasks = [
+            asyncio.create_task(server.generate(prompt, top_k=1)) for prompt in prompts
+        ]
 
-        # archived sampling params: min_p=0.1
-        out_dict = await server.generate(prompt, top_k=1)
+    results = await asyncio.gather(*tasks)
+
+    for i, result in enumerate(results):
+        print(f"Prompt {i}")
         if BENCHMARK >= 1:
             benchmark_memory(f"after prompt {i}", device)
-            print(f"benchmark stats: TTFT: {out_dict['benchmarks']['TTFT']}, TBT: {out_dict['benchmarks']['TBT']}")
+            print(f"benchmark stats: TTFT: {result['benchmarks']['TTFT']}, TBT: {result['benchmarks']['TBT']}")
         print("text:")
-        print(out_dict['text'])
+        print(result['text'])
 
 
 if __name__ == "__main__":

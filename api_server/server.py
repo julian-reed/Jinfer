@@ -15,7 +15,7 @@ from model.constants import MODEL_ID
 
 
 class Server():
-    def __init__(self, debug=0, benchmark=0, device="mps"):
+    def __init__(self, skip_load=False, debug=0, benchmark=0, device="mps"):
         self.tokenzier = AutoTokenizer.from_pretrained(MODEL_ID)
         self.debug = debug
         self.benchmark = benchmark
@@ -29,17 +29,20 @@ class Server():
             self.device = "mps"
         print(f"Using device {self.device}")
 
-        self.engine = Engine(debug, benchmark, self.device)
+        self.engine = Engine(skip_load, debug, benchmark, self.device)
+        self.requests_added = 0
 
     async def generate(self, prompt: str, temperature=1.0, top_k=-1, top_p=-1.0, min_p=-1.0) -> dict[str, Any]:
         tokenized = self.tokenize(prompt)
         params = SamplingParams(temperature, top_k, top_p, min_p)
         req = Request(
-                tokens=tokenized["input_ids"],
-                attn_mask=tokenized["attention_mask"],
+                tokens=tokenized["input_ids"], # shape [1, seq_len]
+                attn_mask=tokenized["attention_mask"], # shape [1, seq_len]
                 sampling_params=params,
             )
         streamer = self.engine.add_request(req)
+        self.requests_added += 1
+        req_num = self.requests_added
 
         last_generated = None
         tokens_processed = 0
@@ -53,13 +56,13 @@ class Server():
                 last_generated = perf_counter()
                 ttft = last_generated - ttft
                 if self.benchmark >= 1:
-                    print(f"token #{tokens_processed}: '{token}' generated in {ttft} sec")
+                    print(f"[Request {req_num}] token #{tokens_processed}: '{token}' generated in {ttft} sec")
             else: 
 
                 tbt = generated_at - last_generated
                 tbt_sum += tbt
                 if self.benchmark >= 1:
-                    print(f"token #{tokens_processed}: '{token}' generated in {tbt} sec")
+                    print(f"[Request {req_num}] token #{tokens_processed}: '{token}' generated in {tbt} sec")
             last_generated = generated_at
 
         benchmarks = {'TTFT':ttft, 'TBT':tbt_sum / tokens_processed}

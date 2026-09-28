@@ -29,7 +29,7 @@ def load_hf_weights(jllama, hf_model):
     new_state = {}
 
     # Embedding
-    new_state["embeddings.weight"] = hf_state[
+    new_state["embedding.weight"] = hf_state[
         "model.embed_tokens.weight"
     ]
 

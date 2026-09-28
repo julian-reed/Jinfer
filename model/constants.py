@@ -4,4 +4,5 @@ Define constants that are used across multiple files, so they all stay consisten
 
 MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 EOS_TOKEN_ID = 128009 # derived from tokenizer.eos_token_id
-BATCH_SIZE = 1 # there's a good argument this should just live in engine.py, but leave for now
+PAD_TOKEN_ID = EOS_TOKEN_ID # llama has no pad token, so just use EOS
+BATCH_SIZE = 3 # there's a good argument this should just live in engine.py, but leave for now

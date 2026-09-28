@@ -118,6 +118,9 @@ class Request:
         self.kv_cache = None
         self.cache_len = 0
 
+    def __repr__(self) -> str:
+        return f"Request(status={self.status}, text={''.join(self.text)}, cache_blocks={self.cache_blocks})"
+
     def append_token_id(self, new_token: int) -> None:
         # todo: change this so it doesn't alloc new memory each time
         # use new_tensor to match data type and device

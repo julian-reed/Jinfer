@@ -1,4 +1,5 @@
 import torch
+import sys
 from torch import nn
 import torch.nn.functional as F
 from math import sqrt
@@ -33,17 +34,35 @@ def rope(
     Assumes:
         - x is already split into attention heads
         - D == head_dim
-        - position_ids has shape [S] and contains absolute positions
+        - position_ids has shape [S] or [B, S]
         - config contains Llama 3 rope parameters
     """
-    _, _, seq_len, head_dim = x.shape
+    # print(
+    #   "ROPE:",
+    #   "x=", x.shape,
+    #   "position_ids=", position_ids.shape,
+    #   flush=True,
+    #   file=sys.stderr,
+    # )
+
+
+    batch_size, _, seq_len, head_dim = x.shape
 
     if head_dim % 2 != 0:
         raise ValueError(f"head_dim must be even, got {head_dim}")
 
-    if position_ids.ndim != 1 or position_ids.shape[0] != seq_len:
+    if position_ids.ndim == 1:
+        if position_ids.shape[0] != seq_len:
+            raise ValueError(
+                f"position_ids must have shape [{seq_len}] or "
+                f"[{batch_size}, {seq_len}], "
+                f"got {tuple(position_ids.shape)}"
+            )
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+    elif position_ids.shape != (batch_size, seq_len):
         raise ValueError(
-            f"position_ids must have shape [{seq_len}], "
+            f"position_ids must have shape [{seq_len}] or "
+            f"[{batch_size}, {seq_len}], "
             f"got {tuple(position_ids.shape)}"
         )
 
@@ -111,8 +130,8 @@ def rope(
         inv_freq,
     )
 
-    # [S, D/2]
-    freqs = torch.outer(position_ids, inv_freq)
+    # [B, S, D/2]
+    freqs = position_ids[..., None] * inv_freq
 
     # Llama/HF convention duplicates frequencies across
     # the first and second halves of head_dim.
@@ -121,9 +140,9 @@ def rope(
     cos = emb.cos().to(dtype=x.dtype)
     sin = emb.sin().to(dtype=x.dtype)
 
-    # [1, 1, S, D] so they broadcast over B and H
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
+    # [B, 1, S, D] so they broadcast over attention heads.
+    cos = cos[:, None, :, :]
+    sin = sin[:, None, :, :]
 
     # Llama rotate_half convention
     x1 = x[..., : head_dim // 2]
@@ -140,7 +159,6 @@ def rope(
 class GroupQueryAttention(nn.Module):
     def __init__(self, config, layer_idx) -> None:
         super().__init__()
-        # self.heads = nn.ModuleList([SingleGQA(config) for _ in range(config.num_attention_heads)])
         self.config = config
         self.q_proj = nn.Linear(config.hidden_size, config.head_dim * config.num_attention_heads, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, config.head_dim * config.num_key_value_heads, bias=config.attention_bias)
@@ -148,7 +166,7 @@ class GroupQueryAttention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.layer_idx = layer_idx
 
-    def forward(self, x: torch.Tensor, cache_blocks: torch.Tensor, cache_len: list[int], kv_cache: torch.Tensor):
+    def forward(self, x: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor):
         # first, get projections
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -159,17 +177,31 @@ class GroupQueryAttention(nn.Module):
         k = k.view(k.shape[0], k.shape[1], self.config.num_key_value_heads, self.config.head_dim).transpose(1,2)
         v = v.view(v.shape[0], v.shape[1], self.config.num_key_value_heads, self.config.head_dim).transpose(1,2)
 
-        # note: with padding num_tokens will be wrong for batches
-        num_tokens = x.shape[-2]
+        num_tokens = x.shape[1]
+        # this works because of left padding, all sequences in batch have the some
+        # cache length and logit is rightmost (also assumes all requests are in same phase)
         start_idx = cache_len[0]
         end_idx = start_idx + num_tokens
 
-        # apply rope
-        position_ids = torch.arange(
+        # Cache slots use a shared padded timeline, while RoPE uses each
+        # sequence's logical position timeline.
+        pad_lengths = torch.tensor(
+            [(max(prompt_lens) - prompt_len) for prompt_len in prompt_lens],
+            device=x.device,
+            dtype=torch.long,
+        )
+        physical_positions = torch.arange(
             start_idx,
             end_idx,
             device=x.device,
         )
+        position_ids = (
+            physical_positions[None, :] - pad_lengths[:, None]
+        ).clamp_min(0)
+        # print(f"pad lengths: {pad_lengths.shape}")
+        # print(f"physical_positions: {physical_positions.shape}")
+        # print(f"position_ids: {position_ids.shape}")
+
         q_rope = rope(q, self.config.rope_parameters, position_ids)
         k_rope = rope(k, self.config.rope_parameters, position_ids)
 
@@ -177,12 +209,20 @@ class GroupQueryAttention(nn.Module):
         # index to use along batch dim), kv cache tensors have dim 
         # [layer_num, 2, batch size, num k/v heads, sequence len, hidden_size]
 
-        # select first sequence in batch (0), then first and only block in the sequence (0)
-        kv_cache[self.layer_idx, 0, :, :, start_idx:end_idx, :] = k_rope
-        kv_cache[self.layer_idx, 1, :, :, start_idx:end_idx, :] = v
+        # select just the requests (along batch size dimension) that are active right now, using
+        # the fact that cache blocks is just a one element list
+        batchwise_indicies = torch.Tensor([req_blocks[0] for req_blocks in cache_blocks]).to(device=kv_cache.device, dtype=torch.long)
 
-        cached_k = kv_cache[self.layer_idx, 0, :, :, :end_idx, :]
-        cached_v = kv_cache[self.layer_idx, 1, :, :, :end_idx, :]
+        # choosing to store even the padded keys for simplicity, following code manages this
+        kv_cache[self.layer_idx, 0, :, :, start_idx:end_idx, :].index_copy_(0, batchwise_indicies, k_rope)
+        # kv_cache[self.layer_idx, 0, :, :, start_idx:end_idx, :] = k_rope
+        kv_cache[self.layer_idx, 1, :, :, start_idx:end_idx, :].index_copy_(0, batchwise_indicies, v)
+        # kv_cache[self.layer_idx, 1, :, :, start_idx:end_idx, :] = v
+
+        # cached_k = kv_cache[self.layer_idx, 0, :, :, :end_idx, :]
+        # cached_v = kv_cache[self.layer_idx, 1, :, :, :end_idx, :]
+        cached_k = kv_cache[self.layer_idx, 0, :, :, :end_idx, :].index_select(0, batchwise_indicies)
+        cached_v = kv_cache[self.layer_idx, 1, :, :, :end_idx, :].index_select(0, batchwise_indicies)
 
         # scale k and v to match correct dimensions
         scale_factor = self.config.num_attention_heads // self.config.num_key_value_heads
@@ -195,18 +235,37 @@ class GroupQueryAttention(nn.Module):
         # s = (q_rope @ k_rope.transpose(-1, -2)) / sqrt(self.config.head_dim)
         s = (q_rope @ k.transpose(-1, -2)) / sqrt(self.config.head_dim)
 
-        # want to skip masking during decode (where shape of s is [..., 1, S])
+        all_positions = torch.arange(end_idx, device=s.device, dtype=torch.int32)
+        valid_keys = all_positions[None, :] >= pad_lengths[:, None]
+        valid_queries = valid_keys
+
+        # we need more complicated masking for prefill
         if s.shape[-2] != 1:
-            # set up upper triangular (not including main diagonal) mask
-            seq_len = s.shape[-1]
-            causal_mask = torch.ones( # need to explicitly convert device since this isn't a param
-                  seq_len, seq_len, dtype=torch.bool, device=s.device
-              ).triu(diagonal=1)
+            casual = all_positions[None, :] <= all_positions[:, None]
+            # generate combined mask that is valid both casually and w.r.t. each seq len
+            casual_and_positional = casual[None, :, :] & valid_keys[:, None, :]
 
-            # computing softmax in float32 to match convention
-            s = s.masked_fill(causal_mask, float('-inf')).float()
+            # at this point, the mask is correct. However, due to padded queries, some rows
+            # in the score matrix will be entirely masked out, which would cause NaNs in the
+            # softmax. To avoid this, allow padded queries to attend to valid keys, and 
+            # remove the impact of padded queries after softmax has been caclculated
+            # broadcasting: queries are rows in the score matmul and keys are columns, so bradcast
+            # valid queries across all columns and broadcast keys across all rows
+            valid_pos = casual_and_positional | (~valid_queries[:, :, None] & valid_keys[:, None, :])
+            
+            # unsqueeze to broadcast across head dimension
+            s.masked_fill_(~valid_pos[:, None, :, :], float('-inf'))
 
-        p = torch.softmax(s, dim=-1).to(v.dtype)
+            p = torch.softmax(s, dim=-1).to(v.dtype)
+            # reverse the softmax patching we did before 
+            p = p.masked_fill(~valid_queries[:, None, :, None], 0.0)
+
+        else:
+            # mask out invalid keys
+            s.masked_fill_(~valid_keys[:, None, None, :], float('-inf'))
+            p = torch.softmax(s, dim=-1).to(v.dtype)
+
+        # rearrange output to [B, # heads, seq_len, head_dim] to [B, seq_len, hidden_dim]
         out = (p @ v).transpose(1, 2).flatten(-2, -1)
         return self.o_proj(out)
 
@@ -221,8 +280,8 @@ class Block(nn.Module):
         self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_idx = layer_idx
 
-    def forward(self, x: torch.Tensor, cache_blocks: torch.Tensor, cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
-        attn_out = self.attention(self.attn_norm(x), cache_blocks, cache_len, kv_cache)
+    def forward(self, x: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
+        attn_out = self.attention(self.attn_norm(x), prompt_lens, cache_blocks, cache_len, kv_cache)
         x = x + attn_out
         mlp_out = self.mlp(self.mlp_norm(x))
         return x + mlp_out
@@ -237,21 +296,21 @@ class JLlama(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.embeddings = nn.Embedding(config.vocab_size, config.hidden_size)        
+        self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)        
         # use ModuleList to track internal state correctly
         self.layers = nn.ModuleList([Block(config, i) for i  in range(config.num_hidden_layers)])
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.max_seq_len = config.max_position_embeddings
 
-    def forward(self, input_ids: torch.Tensor, cache_blocks: torch.Tensor, cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, prompt_lens: list[int], cache_blocks: list[list[int]], cache_len: list[int], kv_cache: torch.Tensor) -> torch.Tensor:
         # check that sequence length is valid
         if input_ids.shape[-1] >= self.max_seq_len:
             raise Exception("max sequence length exceeded")
 
-        x = self.embeddings(input_ids)
+        x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x, cache_blocks, cache_len, kv_cache)
+            x = layer(x, prompt_lens, cache_blocks, cache_len, kv_cache)
         x = self.norm(x)
         logits = self.lm_head(x)
         return logits

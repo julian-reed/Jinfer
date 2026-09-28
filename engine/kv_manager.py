@@ -2,6 +2,8 @@ from model.constants import BATCH_SIZE, MODEL_ID
 from transformers import AutoConfig
 import torch
 
+JR_TOKEN_LIMIT = 1024
+
 class KVManager:
     '''
     Manages the KV Cache
@@ -23,7 +25,8 @@ class KVManager:
                 2,
                 BATCH_SIZE,
                 self.config.num_key_value_heads,
-                self.config.max_position_embeddings,
+                # self.config.max_position_embeddings,
+                JR_TOKEN_LIMIT, # this should be max seq len, but to save memory just use the cutoff of my patience
                 self.config.head_dim,
                 ), dtype=self.config.dtype).to(device=device)
 
@@ -32,7 +35,9 @@ class KVManager:
     def get_block(self) -> int:
         # in the future will need to pass batch size once it's dynamic
         idx = self.physical_block_count
-        self.physical_block_count += 1
+        # again this is janky for now, but since we use the block number to index
+        # along batch dimension, these need to be bounded by batch size
+        self.physical_block_count = (self.physical_block_count + 1) % BATCH_SIZE
         # self.physical_block_to_tensor[idx] = kv_tensor
         return idx
     
