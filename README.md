@@ -1,6 +1,6 @@
 # Jinfer: An Instructional Inference Engine
 
-## Step 4: Continuous Batching + PagedAttention
+An inference engine built from first principles, for learning. See the blog post here: https://juliantreed.com/jinfer.html
 
 Implemented so far:
 - Basic Llama 3 Transformer
@@ -8,3 +8,4 @@ Implemented so far:
 - KV Caching
 - Static Batching
 - Continuous Batching + PagedAttention
+- More coming soon :)
